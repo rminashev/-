@@ -39,6 +39,8 @@ body{display:flex;flex-direction:column;padding-top:env(safe-area-inset-top,0px)
   <select id="fStat"><option value="">Все статусы</option></select>
   <input id="fQ" placeholder="Код…" type="search">
   <button id="exp">Скачать CSV</button>
+  <button id="imp">Загрузить CSV</button>
+  <input id="impf" type="file" accept=".csv,text/csv,text/plain" hidden>
 </div>
 <div id="stats"></div>
 <div id="map"></div>
@@ -59,11 +61,16 @@ var DATA = [["TURKLU0309","АПК ЛУ","Махтаарал","Построено
 var STATUS = {"Не построено":"#d93025","В работе":"#f9ab00","Построено":"#1e8e3e","Сдано":"#1a73e8","Есть замечания":"#a142f4"};
 var KEY = "turk-statuses-v1", MAXPTS = 10;
 
-var saved = {};
+var saved = {}, TS = {};
 try { saved = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) {}
-DATA.forEach(function (d) { if (saved[d[0]] && STATUS[saved[d[0]]]) d[3] = saved[d[0]]; });
+DATA.forEach(function (d) {
+  var v = saved[d[0]]; if (!v) return;
+  var s = typeof v === "string" ? v : v.s;
+  if (STATUS[s]) d[3] = s;
+  TS[d[0]] = typeof v === "string" ? 0 : (v.t || 0);
+});
 function save() {
-  var o = {}; DATA.forEach(function (d) { o[d[0]] = d[3]; });
+  var o = {}; DATA.forEach(function (d) { o[d[0]] = {s: d[3], t: TS[d[0]] || 0}; });
   try { localStorage.setItem(KEY, JSON.stringify(o)); } catch (e) {}
 }
 
@@ -129,7 +136,7 @@ function openPopup(i) {
   var a = document.createElement("div"); a.textContent = d[6]; el.appendChild(a);
   var s = document.createElement("select");
   Object.keys(STATUS).forEach(function (k) { var o = document.createElement("option"); o.textContent = k; o.selected = k === d[3]; s.appendChild(o); });
-  s.onchange = function () { d[3] = s.value; markers[i].setStyle({fillColor: STATUS[d[3]]}); save(); stats(); };
+  s.onchange = function () { d[3] = s.value; TS[d[0]] = Date.now(); markers[i].setStyle({fillColor: STATUS[d[3]]}); save(); stats(); };
   el.appendChild(s);
   var b = document.createElement("div"); b.className = "btns";
   var n1 = document.createElement("a"); n1.className = "btn pri"; n1.textContent = "Навигатор"; n1.href = naviLink([d]); b.appendChild(n1);
@@ -177,11 +184,61 @@ sort.onclick = function () {
 clr.onclick = function () { route = []; drawRoute(); };
 
 exp.onclick = function () {
-  var rows = [["Код", "Тип", "Район", "Статус", "Широта", "Долгота", "Адрес"]].concat(DATA);
+  var rows = [["Код", "Тип", "Район", "Статус", "Широта", "Долгота", "Адрес", "Изменено"]].concat(
+    DATA.map(function (d) { return d.concat(TS[d[0]] ? new Date(TS[d[0]]).toISOString() : ""); }));
   var csv = rows.map(function (r) { return r.map(function (v) { return '"' + String(v).replace(/"/g, '""') + '"'; }).join(";"); }).join("\r\n");
   var a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob(["\ufeff" + csv], {type: "text/csv;charset=utf-8"}));
   a.download = "objects_status.csv"; a.click();
+};
+
+function parseCSV(text) {
+  text = text.replace(/^\ufeff/, "");
+  var first = text.split(/\r?\n/)[0] || "";
+  var delim = [";", "\t", ","].map(function (c) { return [c, first.split(c).length]; })
+    .sort(function (a, b) { return b[1] - a[1]; })[0][0];
+  var rows = [], row = [], cur = "", q = false;
+  for (var i = 0; i < text.length; i++) {
+    var ch = text[i];
+    if (q) {
+      if (ch === '"') { if (text[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += ch;
+    } else if (ch === '"') q = true;
+    else if (ch === delim) { row.push(cur); cur = ""; }
+    else if (ch === "\n" || ch === "\r") {
+      if (ch === "\r" && text[i + 1] === "\n") i++;
+      row.push(cur); cur = ""; rows.push(row); row = [];
+    } else cur += ch;
+  }
+  if (cur !== "" || row.length) { row.push(cur); rows.push(row); }
+  return rows.filter(function (r) { return r.some(function (c) { return c.trim() !== ""; }); });
+}
+imp.onclick = function () { impf.value = ""; impf.click(); };
+impf.onchange = function () {
+  var f = impf.files[0]; if (!f) return;
+  var rd = new FileReader();
+  rd.onload = function () {
+    var rows = parseCSV(String(rd.result));
+    var h = rows[0].map(function (c) { return c.trim().toLowerCase(); });
+    var ci = h.indexOf("код"), si = h.indexOf("статус"), ti = h.indexOf("изменено");
+    if (ci < 0 || si < 0) { alert("В файле нет колонок «Код» и «Статус». Загрузите CSV, скачанный из этой карты."); return; }
+    var idx = {}; DATA.forEach(function (d, i) { idx[d[0]] = i; });
+    var upd = 0, kept = 0, same = 0, unk = 0, bad = 0;
+    rows.slice(1).forEach(function (r) {
+      var code = (r[ci] || "").trim(), st = (r[si] || "").trim();
+      var i = idx[code];
+      if (i === undefined) { unk++; return; }
+      if (!STATUS[st]) { bad++; return; }
+      var t = ti >= 0 ? (Date.parse(r[ti]) || 0) : 0, loc = TS[code] || 0, d = DATA[i];
+      if (d[3] === st) { same++; if (t > loc) TS[code] = t; return; }
+      if (t > loc || (t === 0 && loc === 0)) {
+        d[3] = st; TS[code] = t; markers[i].setStyle({fillColor: STATUS[st]}); upd++;
+      } else kept++;
+    });
+    save(); stats();
+    alert("Обновлено: " + upd + "\nОставлено ваших (они новее): " + kept + "\nСовпало: " + same +
+      (unk ? "\nКодов нет в карте: " + unk : "") + (bad ? "\nНеизвестный статус: " + bad : ""));
+  };
+  rd.readAsText(f, "utf-8");
 };
 
 apply(true);
